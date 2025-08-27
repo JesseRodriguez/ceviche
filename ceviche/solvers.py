@@ -4,14 +4,47 @@ import scipy.sparse.linalg as spl
 
 """ This file stores the various sparse linear system solvers you can use for FDFD """
 
-# try to import MKL but just use scipy sparse solve if not
+# ----------------------------------------------------------------------
+# Portable, high-performance solver selection
+#  - x86_64 (Intel/AMD): prefer PARDISO via pypardiso or legacy pyMKL
+#  - Apple Silicon / other arch: use SciPy; prefer UMFPACK if present
+#  - Manual override: CEVICHE_SOLVER={pardiso,scipy}
+# ----------------------------------------------------------------------
+import os
+import platform
+
+_ARCH = platform.machine().lower()
+_IS_X86_64 = _ARCH in ("x86_64", "amd64")
+_ENV_SOLVER = os.getenv("CEVICHE_SOLVER", "").lower()
+
+HAVE_PYPARDISO = False
+HAVE_PYMKL = False
+HAVE_UMFPACK = False
+
+if _IS_X86_64:
+    try:
+        from pypardiso import spsolve as _pardiso_spsolve
+        HAVE_PYPARDISO = True
+    except Exception:
+        pass
+    try:
+        from pyMKL import pardisoSolver as _pyMKL_pardisoSolver
+        HAVE_PYMKL = True
+    except Exception:
+        pass
+
 try:
-    from pyMKL import pardisoSolver
-    HAS_MKL = True
-    # print('using MKL for direct solvers')
-except:
+    import scikits.umfpack as _umf
+    HAVE_UMFPACK = True
+except Exception:
+    HAVE_UMFPACK = False
+
+# Backward compatible flag (used later) and default policy
+HAS_MKL = _IS_X86_64 and (HAVE_PYPARDISO or HAVE_PYMKL)
+if _ENV_SOLVER in ("pardiso", "pypardiso"):
+    HAS_MKL = HAS_MKL and _IS_X86_64
+elif _ENV_SOLVER == "scipy":
     HAS_MKL = False
-    # print('using scipy.sparse for direct solvers.  Note: using MKL will make things significantly faster.')
 
 # default iterative method to use
 # for reference on the methods available, see:  https://docs.scipy.org/doc/scipy/reference/sparse.linalg.html
@@ -35,31 +68,59 @@ ATOL = 1e-8
 """ ========================== SOLVER FUNCTIONS ========================== """
 
 def solve_linear(A, b, iterative_method=False):
-    """ Master function to call the others """
+    """Master function to call direct or iterative solvers.
 
-    if iterative_method and iterative_method is not None:
-        # if iterative solver string is supplied, use that method
-        return _solve_iterative(A, b, iterative_method=iterative_method)
-    elif iterative_method and iterative_method is None:
-        # if iterative_method is supplied as None, use the default
-        return _solve_iterative(A, b, iterative_method=DEFAULT_ITERATIVE_METHOD)
-    else:
-        # otherwise, use a direct solver
+    Args:
+        A: sparse matrix (CSR/CSC preferred).
+        b: right-hand side vector/array.
+        iterative_method: False for direct; None for default iterative;
+            or a string key in ITERATIVE_METHODS.
+    """
+    if iterative_method is False:
         return _solve_direct(A, b)
+    if iterative_method is None:
+        return _solve_iterative(A, b, iterative_method=DEFAULT_ITERATIVE_METHOD)
+    return _solve_iterative(A, b, iterative_method=iterative_method)
 
 def _solve_direct(A, b):
-    """ Direct solver """
+    """Direct solver.
+
+    Policy:
+        - On x86_64, prefer PARDISO if available.
+        - Otherwise use SciPy spsolve.
+        - Ensure CSC format for best performance (UMFPACK/SuperLU).
+        - Preserve complex dtype and 1-D RHS.
+    """
+    import scipy.sparse as sp
+
+    b = np.asarray(b)
+    if b.ndim > 1:
+        b = b.reshape((-1,))
+    # Allow real or complex; cast only if needed by solver path
+    if np.iscomplexobj(A) or np.iscomplexobj(b):
+        b = b.astype(np.complex128, copy=False)
+
+    A_csc = A if sp.isspmatrix_csc(A) else A.tocsc()
 
     if HAS_MKL:
-        # prefered method using MKL. Much faster (on Mac at least)
-        pSolve = pardisoSolver(A, mtype=13)
-        pSolve.factor()
-        x = pSolve.solve(b)
-        pSolve.clear()
-        return x
-    else:
-        # scipy solver.
-        return spl.spsolve(A, b)
+        if HAVE_PYPARDISO:
+            # pypardiso: spsolve-like API
+            return _pardiso_spsolve(A_csc, b)
+        if HAVE_PYMKL:
+            # 13 = complex unsymmetric (SC-PML usually non-Hermitian)
+            mtype = 13 if np.iscomplexobj(A_csc.data) else 11
+            ps = _pyMKL_pardisoSolver(A_csc, mtype=mtype)
+            ps.factor()
+            x = ps.solve(b)
+            ps.clear()
+            return x
+
+    # SciPy fallback; prefer UMFPACK if available
+    try:
+        return spl.spsolve(A_csc, b, use_umfpack=HAVE_UMFPACK)
+    except TypeError:
+        # Older SciPy without use_umfpack kw
+        return spl.spsolve(A_csc, b)
 
 def _solve_iterative(A, b, iterative_method=DEFAULT_ITERATIVE_METHOD):
     """ Iterative solver """
